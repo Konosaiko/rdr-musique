@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>k_camp yt-relay</title>
+    <!--
+        k_camp - page-relais YouTube du gramophone.
+        A HEBERGER EN HTTPS (GitHub Pages) : YouTube refuse son lecteur integre (erreur 153) quand
+        la page parente n'a pas de Referer https, ce qui est le cas de la NUI (nui://k_camp).
+        La NUI charge cette page dans une iframe invisible et la pilote par postMessage :
+          parent -> relais : {cmd:'load', videoId, start, volume} | {cmd:'seek', t} | {cmd:'volume', v} | {cmd:'stop'}
+          relais -> parent : {ev:'ready'} | {ev:'time', t, duration, state, real} | {ev:'ended'}
+                             | {ev:'error', code} | {ev:'debug', msg}
+        « Gate » anti-pub : l'API ne signale pas les pubs. On ne laisse donc passer le son que
+        lorsque NOTRE video joue vraiment (etat PLAYING et compteur qui avance au rythme de
+        l'horloge) ; pendant une pub le compteur de la video reste fige -> silence.
+        ?debug=1 : journal de l'etat / du temps / du gate (renvoye aussi au parent).
+        ?test=<videoId> : ouverture directe dans un navigateur, lecteur visible, pour verifier l'hebergement.
+    -->
+    <style>
+        html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+        #player { width: 200px; height: 200px; }
+        body.test #player { width: 480px; height: 270px; }
+        body.test { color: #ccc; font: 13px monospace; overflow: auto; }
+        #log { white-space: pre; padding: 8px; }
+    </style>
+</head>
+<body>
+<div id="player"></div>
+<div id="log"></div>
+<script>
+(() => {
+    'use strict';
+
+    const params = new URLSearchParams(location.search);
+    const DEBUG = params.get('debug') === '1' || params.has('test');
+    const TEST_ID = params.get('test');
+    const embedded = window.parent !== window;
+
+    const send = (m) => { if (embedded) window.parent.postMessage(m, '*'); };
+
+    const logEl = document.getElementById('log');
+    function dbg(msg) {
+        if (!DEBUG) return;
+        console.log('[yt-relay] ' + msg);
+        send({ ev: 'debug', msg });
+        if (!embedded) logEl.textContent = (msg + '\n' + logEl.textContent).slice(0, 6000);
+    }
+
+    let apiReady = false;
+    let player = null;
+    let playerReady = false;
+    let pendingLoad = null;   // commande load recue avant que l'API / le lecteur soient prets
+    let videoId = null;
+    let wantVol = 0;          // volume demande par le parent (0-100)
+    let appliedVol = -1;      // volume reellement applique au lecteur
+    let gate = false;         // true = notre video joue vraiment, le son passe
+    let lastT = null, lastPerf = 0, openStreak = 0;
+    let lastDbg = '', lastDbgAt = 0, lastTimeSent = 0;
+
+    function applyVolume() {
+        if (!playerReady) return;
+        const v = gate ? wantVol : 0;
+        if (v === appliedVol) return;
+        appliedVol = v;
+        try { player.setVolume(v); } catch (e) { /* lecteur detruit */ }
+    }
+
+    function setGate(open, why) {
+        if (gate === open) return;
+        gate = open;
+        dbg(`gate ${open ? 'OUVERT' : 'ferme'} (${why})`);
+        applyVolume(); // fermeture immediate : une pub ne doit pas s'entendre
+    }
+
+    function resetTiming() { lastT = null; openStreak = 0; }
+
+    function load(cmd) {
+        videoId = String(cmd.videoId || '');
+        wantVol = Math.max(0, Math.min(100, Math.round(Number(cmd.volume) || 0)));
+        const start = Math.max(0, Number(cmd.start) || 0);
+        gate = false;
+        appliedVol = -1;
+        resetTiming();
+        if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) { send({ ev: 'error', code: 2 }); return; }
+        if (!apiReady) { pendingLoad = cmd; return; }
+
+        if (!player) {
+            player = new YT.Player('player', {
+                width: TEST_ID ? 480 : 200,
+                height: TEST_ID ? 270 : 200,
+                videoId,
+                playerVars: {
+                    autoplay: 1, controls: TEST_ID ? 1 : 0, disablekb: 1, playsinline: 1,
+                    fs: 0, rel: 0, iv_load_policy: 3, start: Math.floor(start),
+                    origin: location.origin,
+                },
+                events: {
+                    onReady: () => {
+                        playerReady = true;
+                        applyVolume(); // volume 0 tant que le gate est ferme
+                        if (start % 1 > 0.05) { try { player.seekTo(start, true); } catch (e) { /* */ } }
+                        try { player.playVideo(); } catch (e) { /* */ }
+                        dbg(`lecteur pret, video ${videoId} @ ${start.toFixed(1)} s`);
+                    },
+                    onStateChange: (e) => {
+                        dbg(`etat ${e.data}`);
+                        if (e.data === 0) { setGate(false, 'fin'); send({ ev: 'ended' }); }
+                    },
+                    onError: (e) => {
+                        dbg(`erreur ${e.data}`);
+                        send({ ev: 'error', code: e.data });
+                    },
+                },
+            });
+        } else if (playerReady) {
+            try { player.loadVideoById({ videoId, startSeconds: start }); } catch (e) { /* */ }
+            applyVolume();
+            dbg(`nouvelle video ${videoId} @ ${start.toFixed(1)} s`);
+        } else {
+            pendingLoad = cmd; // le lecteur est en cours de creation : rejoue apres onReady
+        }
+    }
+
+    // Sondage : etat du gate + position remontee au parent
+    setInterval(() => {
+        if (!playerReady) return;
+        if (pendingLoad && apiReady) { const c = pendingLoad; pendingLoad = null; load(c); return; }
+
+        let st = -1, t = 0;
+        try { st = player.getPlayerState(); t = player.getCurrentTime() || 0; } catch (e) { return; }
+        const now = performance.now();
+
+        if (st !== 1) {
+            setGate(false, `etat ${st}`);
+            openStreak = 0;
+        } else if (lastT !== null) {
+            const dMedia = t - lastT;
+            const dWall = (now - lastPerf) / 1000;
+            // le compteur de NOTRE video avance au rythme de l'horloge (tolerance large)
+            const advancing = dMedia > 0.2 * dWall && dMedia < 2 * dWall + 0.3;
+            if (advancing) {
+                if (++openStreak >= 2) setGate(true, 'lecture reelle');
+            } else if (Math.abs(dMedia) < 0.01) {
+                // compteur fige alors que le lecteur se dit en lecture : pub (ou chargement)
+                openStreak = 0;
+                setGate(false, 'compteur fige');
+            }
+            // sinon saut de position (seek) : on garde l'etat courant
+        }
+        lastT = t; lastPerf = now;
+
+        if (DEBUG) {
+            const sig = `${st}|${gate}`;
+            if (sig !== lastDbg || now - lastDbgAt > 2000) {
+                lastDbg = sig; lastDbgAt = now;
+                dbg(`etat=${st} t=${t.toFixed(2)} gate=${gate}`);
+            }
+        }
+
+        if (now - lastTimeSent >= 1000) {
+            lastTimeSent = now;
+            let duration = 0;
+            // pendant une pub, getDuration() peut renvoyer la duree de la pub : on ne la remonte
+            // que lorsque notre video joue vraiment
+            if (gate) { try { duration = player.getDuration() || 0; } catch (e) { /* */ } }
+            send({ ev: 'time', t, duration, state: st, real: gate });
+        }
+    }, 250);
+
+    window.addEventListener('message', (event) => {
+        if (embedded && event.source !== window.parent) return;
+        const m = event.data;
+        if (!m || typeof m !== 'object' || typeof m.cmd !== 'string') return;
+        switch (m.cmd) {
+            case 'load':
+                load(m);
+                break;
+            case 'seek':
+                if (!playerReady) break;
+                resetTiming(); // le saut ne doit pas etre pris pour une pub ni une lecture reelle
+                try {
+                    player.seekTo(Math.max(0, Number(m.t) || 0), true);
+                    const st = player.getPlayerState();
+                    if (st === 0 || st === 2 || st === 5) player.playVideo();
+                } catch (e) { /* */ }
+                break;
+            case 'volume':
+                wantVol = Math.max(0, Math.min(100, Math.round(Number(m.v) || 0)));
+                applyVolume();
+                break;
+            case 'stop':
+                setGate(false, 'stop');
+                try { player && player.stopVideo(); } catch (e) { /* */ }
+                break;
+        }
+    });
+
+    // API YouTube
+    window.onYouTubeIframeAPIReady = () => {
+        apiReady = true;
+        dbg('API YouTube chargee');
+        if (pendingLoad) { const c = pendingLoad; pendingLoad = null; load(c); }
+    };
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    tag.onerror = () => { dbg('API YouTube injoignable'); send({ ev: 'error', code: 'api' }); };
+    document.head.appendChild(tag);
+
+    if (TEST_ID) {
+        document.body.classList.add('test');
+        load({ videoId: TEST_ID, start: 0, volume: 50 });
+    }
+    send({ ev: 'ready' });
+})();
+</script>
+</body>
+</html>
